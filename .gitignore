@@ -1,0 +1,11 @@
+# Large CSV datasets
+database/causal_data.csv
+database/transaction_data.csv
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual environments
+.venv/
+venv/
