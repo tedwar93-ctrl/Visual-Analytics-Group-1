@@ -384,8 +384,8 @@ def compare_before_during_after(
     if use_clean_windows:
         pre_s = int(episode.get("pre_start_week_clean", episode["pre_start_week_nominal"]))
         post_e = int(episode.get("post_end_week_clean", episode["post_end_week_nominal"]))
-        pre_wks = int(episode.get("pre_actual_weeks", episode["end_week"] - pre_s))
-        post_wks = int(episode.get("post_actual_weeks", post_e - episode["end_week"]))
+        pre_wks = int(episode.get("pre_actual_weeks", max(0, dur_s - pre_s)))
+        post_wks = int(episode.get("post_actual_weeks", max(0, post_e - dur_e)))
     else:
         pre_s = int(episode["pre_start_week_nominal"])
         post_e = int(episode["post_end_week_nominal"])
@@ -520,8 +520,8 @@ def get_household_behavior_summary(
     if use_clean_windows:
         pre_s = int(episode.get("pre_start_week_clean", episode["pre_start_week_nominal"]))
         post_e = int(episode.get("post_end_week_clean", episode["post_end_week_nominal"]))
-        pre_wks = int(episode.get("pre_actual_weeks", dur_s - pre_s))
-        post_wks = int(episode.get("post_actual_weeks", post_e - dur_e))
+        pre_wks = int(episode.get("pre_actual_weeks", max(0, dur_s - pre_s)))
+        post_wks = int(episode.get("post_actual_weeks", max(0, post_e - dur_e)))
     else:
         pre_s = int(episode["pre_start_week_nominal"])
         post_e = int(episode["post_end_week_nominal"])

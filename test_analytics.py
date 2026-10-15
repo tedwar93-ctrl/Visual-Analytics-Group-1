@@ -244,6 +244,121 @@ class TestAnalytics(unittest.TestCase):
         w10 = trends[trends["WEEK_NO"] == 10].iloc[0]
         self.assertEqual(w10["causal_coverage_status"], "Recorded")
 
+    def test_product_5569230_exact_validation_case_study(self):
+        """
+        Regression Test: Validates exact Step 3 numbers for Product ID 5569230 (SOFT DRINKS):
+        - Before (Weeks 26-29): [17, 23, 40, 26] -> average 26.5 units/week
+        - During (Week 30): 236 units -> +790.6% lift
+        - Clean After (Weeks 31-33): [25, 22, 31] -> average 26.0 units/week (-1.89% vs Pre)
+        - Exclude Week 34 (320 units) due to subsequent promotion.
+        """
+        records = []
+        # Pre: Weeks 26-29
+        pre_quantities = {26: 17, 27: 23, 28: 40, 29: 26}
+        for wk, qty in pre_quantities.items():
+            records.append({
+                "household_key": 1, "BASKET_ID": 1000 + wk, "DAY": (wk - 1) * 7 + 1,
+                "PRODUCT_ID": 5569230, "QUANTITY": qty, "SALES_VALUE": qty * 4.0,
+                "STORE_ID": 501, "WEEK_NO": wk, "has_causal_evidence": False,
+                "total_discount_val": 0.0, "discount_depth_pct": 0.0,
+                "causal_coverage_status": "Recorded", "DEPARTMENT": "GROCERY",
+                "COMMODITY_DESC": "SOFT DRINKS", "SUB_COMMODITY_DESC": "COLA CAN"
+            })
+        # During: Week 30 (Promo 1)
+        records.append({
+            "household_key": 2, "BASKET_ID": 2030, "DAY": (30 - 1) * 7 + 1,
+            "PRODUCT_ID": 5569230, "QUANTITY": 236, "SALES_VALUE": 236 * 2.64,
+            "STORE_ID": 501, "WEEK_NO": 30, "has_causal_evidence": True,
+            "total_discount_val": 236 * 1.36, "discount_depth_pct": 34.0,
+            "causal_coverage_status": "Recorded", "DEPARTMENT": "GROCERY",
+            "COMMODITY_DESC": "SOFT DRINKS", "SUB_COMMODITY_DESC": "COLA CAN"
+        })
+        # Post clean: Weeks 31-33
+        post_quantities = {31: 25, 32: 22, 33: 31}
+        for wk, qty in post_quantities.items():
+            records.append({
+                "household_key": 1, "BASKET_ID": 3000 + wk, "DAY": (wk - 1) * 7 + 1,
+                "PRODUCT_ID": 5569230, "QUANTITY": qty, "SALES_VALUE": qty * 4.0,
+                "STORE_ID": 501, "WEEK_NO": wk, "has_causal_evidence": False,
+                "total_discount_val": 0.0, "discount_depth_pct": 0.0,
+                "causal_coverage_status": "Recorded", "DEPARTMENT": "GROCERY",
+                "COMMODITY_DESC": "SOFT DRINKS", "SUB_COMMODITY_DESC": "COLA CAN"
+            })
+        # Subsequent Promo 2: Week 34
+        records.append({
+            "household_key": 3, "BASKET_ID": 4034, "DAY": (34 - 1) * 7 + 1,
+            "PRODUCT_ID": 5569230, "QUANTITY": 320, "SALES_VALUE": 320 * 2.95,
+            "STORE_ID": 501, "WEEK_NO": 34, "has_causal_evidence": True,
+            "total_discount_val": 320 * 1.05, "discount_depth_pct": 26.2,
+            "causal_coverage_status": "Recorded", "DEPARTMENT": "GROCERY",
+            "COMMODITY_DESC": "SOFT DRINKS", "SUB_COMMODITY_DESC": "COLA CAN"
+        })
+        case_df = pd.DataFrame(records)
+
+        trends = an.get_weekly_trends(case_df, min_week=25, max_week=36)
+        episodes = an.identify_promotion_episodes(trends, min_promo_pct=50.0, pre_window=4, post_window=4)
+        
+        ep_w30 = episodes[episodes["start_week"] == 30].iloc[0]
+        self.assertEqual(ep_w30["pre_actual_weeks"], 4)
+        self.assertEqual(ep_w30["post_actual_weeks"], 3)
+        self.assertTrue(ep_w30["post_is_truncated"])
+        self.assertEqual(ep_w30["post_truncation_reason"], "Subsequent promotion at Week 34")
+
+        # Clean comparison
+        bda_clean = an.compare_before_during_after(case_df, ep_w30, use_clean_windows=True).iloc[0]
+        self.assertAlmostEqual(bda_clean["pre_units_per_week"], 26.5)
+        self.assertAlmostEqual(bda_clean["during_units_per_week"], 236.0)
+        self.assertAlmostEqual(bda_clean["post_units_per_week"], 26.0)
+        self.assertAlmostEqual(bda_clean["unit_lift_pct"], 790.566037735849, places=3)
+        self.assertAlmostEqual(bda_clean["post_vs_pre_unit_pct"], -1.8867924528301887, places=3)
+
+        # Contaminated comparison (if Week 34 is not excluded: (78 + 320) / 4 = 99.5)
+        bda_contam = an.compare_before_during_after(case_df, ep_w30, use_clean_windows=False).iloc[0]
+        self.assertAlmostEqual(bda_contam["post_units_per_week"], 99.5)
+        self.assertAlmostEqual(bda_contam["post_vs_pre_unit_pct"], 275.47169811320754, places=3)
+
+    def test_tight_gap_subsequent_promotion(self):
+        """
+        Regression Test: Verifies that a subsequent promotion starting only 2 weeks
+        after an episode end truncates the post-window to exactly 1 clean week.
+        """
+        trends = pd.DataFrame([
+            {"WEEK_NO": 20, "causal_promo_pct": 100.0, "is_promoted_week": True},
+            {"WEEK_NO": 22, "causal_promo_pct": 100.0, "is_promoted_week": True}
+        ])
+        episodes = an.identify_promotion_episodes(trends, min_promo_pct=50.0, pre_window=4, post_window=4)
+        ep1 = episodes.iloc[0]
+        self.assertEqual(ep1["start_week"], 20)
+        self.assertEqual(ep1["post_end_week_clean"], 21)
+        self.assertEqual(ep1["post_actual_weeks"], 1)
+        self.assertTrue(ep1["post_is_truncated"])
+        self.assertEqual(ep1["post_truncation_reason"], "Subsequent promotion at Week 22")
+
+    def test_dataset_boundary_truncation(self):
+        """
+        Regression Test: Verifies truncation at Week 1 and Week 102 dataset boundaries.
+        """
+        trends = pd.DataFrame([
+            {"WEEK_NO": 2, "causal_promo_pct": 100.0, "is_promoted_week": True},
+            {"WEEK_NO": 101, "causal_promo_pct": 100.0, "is_promoted_week": True}
+        ])
+        episodes = an.identify_promotion_episodes(trends, min_promo_pct=50.0, pre_window=4, post_window=4)
+        
+        ep_start = episodes.iloc[0]
+        self.assertEqual(ep_start["pre_start_week_clean"], 1)
+        self.assertEqual(ep_start["pre_actual_weeks"], 1)
+        self.assertTrue(ep_start["pre_is_truncated"])
+        self.assertEqual(ep_start["pre_truncation_reason"], "Dataset start (Week 1)")
+        self.assertFalse(ep_start["causal_coverage_valid"])
+
+        ep_end = episodes.iloc[1]
+        self.assertEqual(ep_end["post_end_week_clean"], 102)
+        self.assertEqual(ep_end["post_actual_weeks"], 1)
+        self.assertTrue(ep_end["post_is_truncated"])
+        self.assertEqual(ep_end["post_truncation_reason"], "Dataset end (Week 102)")
+        self.assertFalse(ep_end["causal_coverage_valid"])
+
 
 if __name__ == "__main__":
     unittest.main()
+
