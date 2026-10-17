@@ -106,7 +106,17 @@ def aggregate_causal_data(causal_filepath=CAUSAL_FILE, target_keys_sorted=None, 
             matched_chunks.append(chunk)
 
     if not matched_chunks:
-        print("Warning: No matching causal records found.")
+        if has_filter and len(target_keys_sorted) > 0:
+            target_arr = np.asarray(target_keys_sorted)
+            if np.all((target_arr % 1000) < 9):
+                print(
+                    "Notice: Target transaction keys are all in Weeks 1–8. Causal promotion data starts at Week 9; "
+                    "all sample transactions will be classified with Unknown causal coverage."
+                )
+            else:
+                print("Warning: No matching causal records found.")
+        else:
+            print("Warning: No matching causal records found.")
         return pd.DataFrame(columns=[
             "PRODUCT_ID", "STORE_ID", "WEEK_NO",
             "display_codes", "mailer_codes",

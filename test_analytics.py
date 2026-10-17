@@ -234,15 +234,25 @@ class TestAnalytics(unittest.TestCase):
 
     def test_unknown_causal_coverage_status(self):
         """
-        Regression Test: Verifies weeks outside 9-101 are flagged as Unknown coverage.
+        Regression Test: Verifies weeks outside 9-101 are flagged as Unknown coverage,
+        causal_promo_pct is NaN, and promo_evaluation_status is Unknown.
         """
         trends = an.get_weekly_trends(self.mock_df, include_returns=False, min_week=1, max_week=20)
         w1 = trends[trends["WEEK_NO"] == 1].iloc[0]
         # Week 1 has no causal records -> Unknown
         self.assertEqual(w1["causal_coverage_status"], "Unknown")
+        self.assertTrue(np.isnan(w1["causal_promo_pct"]))
+        self.assertEqual(w1["promo_evaluation_status"], "Unknown")
+        self.assertFalse(w1["is_promoted_week"])
+        self.assertEqual(w1["causal_coverage_pct"], 0.0)
+
         # Week 10 is inside 9-101 with records -> Recorded
         w10 = trends[trends["WEEK_NO"] == 10].iloc[0]
         self.assertEqual(w10["causal_coverage_status"], "Recorded")
+        self.assertAlmostEqual(w10["causal_promo_pct"], 100.0)
+        self.assertEqual(w10["promo_evaluation_status"], "Promoted")
+        self.assertTrue(w10["is_promoted_week"])
+        self.assertEqual(w10["causal_coverage_pct"], 100.0)
 
     def test_product_5569230_exact_validation_case_study(self):
         """
@@ -357,6 +367,308 @@ class TestAnalytics(unittest.TestCase):
         self.assertTrue(ep_end["post_is_truncated"])
         self.assertEqual(ep_end["post_truncation_reason"], "Dataset end (Week 102)")
         self.assertFalse(ep_end["causal_coverage_valid"])
+
+    def test_unknown_transaction_week_promo_rate_and_status(self):
+        """
+        Tests that active transactions in an unmonitored week (Weeks 1-8 / Unknown)
+        produce causal_promo_pct = NaN, promo_evaluation_status = 'Unknown',
+        and is_promoted_week = False (not confirmed unpromoted).
+        """
+        df_unknown = pd.DataFrame([{
+            "household_key": 1, "BASKET_ID": 1001, "DAY": 3,
+            "PRODUCT_ID": 101, "QUANTITY": 2, "SALES_VALUE": 5.00,
+            "STORE_ID": 501, "WEEK_NO": 1, "has_causal_evidence": False,
+            "total_discount_val": 0.0, "discount_depth_pct": 0.0,
+            "causal_coverage_status": "Unknown", "DEPARTMENT": "GROCERY",
+            "COMMODITY_DESC": "SOFT DRINKS", "SUB_COMMODITY_DESC": "COLA CAN"
+        }])
+        trends = an.get_weekly_trends(df_unknown, min_week=1, max_week=2)
+        w1 = trends[trends["WEEK_NO"] == 1].iloc[0]
+        self.assertEqual(w1["total_units"], 2.0)
+        self.assertEqual(w1["causal_coverage_status"], "Unknown")
+        self.assertTrue(np.isnan(w1["causal_promo_pct"]))
+        self.assertEqual(w1["promo_evaluation_status"], "Unknown")
+        self.assertFalse(w1["is_promoted_week"])
+        self.assertEqual(w1["causal_coverage_pct"], 0.0)
+
+    def test_mixed_coverage_rate_calculation(self):
+        """
+        Tests that mixed coverage calculates causal_promo_pct using ONLY recorded
+        transactions as denominator, and surfaces causal_coverage_pct completeness.
+        """
+        records = []
+        # Store 501: Recorded coverage, 8 promoted, 2 unpromoted (80% promo rate)
+        for i in range(8):
+            records.append({
+                "household_key": 10 + i, "BASKET_ID": 2000 + i, "DAY": 100,
+                "PRODUCT_ID": 101, "QUANTITY": 1, "SALES_VALUE": 3.00,
+                "STORE_ID": 501, "WEEK_NO": 15, "has_causal_evidence": True,
+                "total_discount_val": 1.0, "discount_depth_pct": 25.0,
+                "causal_coverage_status": "Recorded", "DEPARTMENT": "GROCERY",
+                "COMMODITY_DESC": "SOFT DRINKS", "SUB_COMMODITY_DESC": "COLA CAN"
+            })
+        for i in range(2):
+            records.append({
+                "household_key": 20 + i, "BASKET_ID": 2100 + i, "DAY": 100,
+                "PRODUCT_ID": 101, "QUANTITY": 1, "SALES_VALUE": 4.00,
+                "STORE_ID": 501, "WEEK_NO": 15, "has_causal_evidence": False,
+                "total_discount_val": 0.0, "discount_depth_pct": 0.0,
+                "causal_coverage_status": "Recorded", "DEPARTMENT": "GROCERY",
+                "COMMODITY_DESC": "SOFT DRINKS", "SUB_COMMODITY_DESC": "COLA CAN"
+            })
+        # Store 502: Unknown coverage, 10 transactions
+        for i in range(10):
+            records.append({
+                "household_key": 30 + i, "BASKET_ID": 2200 + i, "DAY": 100,
+                "PRODUCT_ID": 101, "QUANTITY": 1, "SALES_VALUE": 4.00,
+                "STORE_ID": 502, "WEEK_NO": 15, "has_causal_evidence": False,
+                "total_discount_val": 0.0, "discount_depth_pct": 0.0,
+                "causal_coverage_status": "Unknown", "DEPARTMENT": "GROCERY",
+                "COMMODITY_DESC": "SOFT DRINKS", "SUB_COMMODITY_DESC": "COLA CAN"
+            })
+        df_mixed = pd.DataFrame(records)
+        trends = an.get_weekly_trends(df_mixed, min_week=15, max_week=15)
+        w15 = trends[trends["WEEK_NO"] == 15].iloc[0]
+
+        self.assertEqual(w15["total_transactions"], 20)
+        self.assertEqual(w15["causal_coverage_status"], "Mixed")
+        self.assertAlmostEqual(w15["causal_coverage_pct"], 50.0)
+        self.assertEqual(w15["causal_promoted_trans_count"], 8)
+        # Denominator should be 10 recorded transactions, yielding 80%, NOT 8/20 = 40%
+        self.assertAlmostEqual(w15["causal_promo_pct"], 80.0)
+        self.assertTrue(w15["is_promoted_week"])
+        self.assertEqual(w15["promo_evaluation_status"], "Promoted")
+
+    def test_zero_transaction_weeks(self):
+        """
+        Tests that zero-transaction weeks in both unmonitored (Weeks 1-8) and
+        monitored (Weeks 9-101) periods retain NaN promo rate and Unknown evaluation status.
+        """
+        # Pass empty DataFrame across Weeks 1 to 10
+        trends_empty = an.get_weekly_trends(pd.DataFrame(columns=["WEEK_NO", "QUANTITY", "SALES_VALUE"]), min_week=1, max_week=10)
+        self.assertEqual(len(trends_empty), 0)
+
+        # Pass 1 transaction in Week 5, leaving Week 1 and Week 9 as zero-transaction weeks
+        df_single = pd.DataFrame([{
+            "household_key": 1, "BASKET_ID": 101, "DAY": 30,
+            "PRODUCT_ID": 101, "QUANTITY": 1, "SALES_VALUE": 2.00,
+            "STORE_ID": 501, "WEEK_NO": 5, "has_causal_evidence": False,
+            "causal_coverage_status": "Unknown", "DEPARTMENT": "GROCERY",
+            "COMMODITY_DESC": "SOFT DRINKS", "SUB_COMMODITY_DESC": "COLA CAN"
+        }])
+        trends_single = an.get_weekly_trends(df_single, min_week=1, max_week=10)
+
+        # Week 1: 0 transactions outside causal range
+        w1 = trends_single[trends_single["WEEK_NO"] == 1].iloc[0]
+        self.assertEqual(w1["total_transactions"], 0)
+        self.assertEqual(w1["causal_coverage_status"], "Unknown")
+        self.assertTrue(np.isnan(w1["causal_promo_pct"]))
+        self.assertEqual(w1["promo_evaluation_status"], "Unknown")
+        self.assertFalse(w1["is_promoted_week"])
+
+        # Week 9: 0 transactions within causal range
+        w9 = trends_single[trends_single["WEEK_NO"] == 9].iloc[0]
+        self.assertEqual(w9["total_transactions"], 0)
+        self.assertEqual(w9["causal_coverage_status"], "Recorded")
+        self.assertTrue(np.isnan(w9["causal_promo_pct"]))
+        self.assertEqual(w9["promo_evaluation_status"], "Unknown")
+        self.assertFalse(w9["is_promoted_week"])
+
+    def test_early_promotion_episode_causal_boundaries(self):
+        """
+        Tests that promotion episodes near Week 9 enforce causal boundaries when requested,
+        and flag coverage warnings in compare_before_during_after.
+        """
+        # Promotion at Week 10 with nominal pre-window Weeks 6-9
+        trends = pd.DataFrame([
+            {"WEEK_NO": 10, "causal_promo_pct": 100.0, "is_promoted_week": True}
+        ])
+
+        # 1. With enforce_causal_boundaries=True: pre-window truncates to Week 9
+        episodes_enforced = an.identify_promotion_episodes(
+            trends, min_promo_pct=50.0, pre_window=4, post_window=4, enforce_causal_boundaries=True
+        )
+        ep_enf = episodes_enforced.iloc[0]
+        self.assertEqual(ep_enf["pre_start_week_clean"], 9)
+        self.assertEqual(ep_enf["pre_actual_weeks"], 1)
+        self.assertTrue(ep_enf["pre_is_truncated"])
+        self.assertEqual(ep_enf["pre_truncation_reason"], "Causal coverage start (Week 9)")
+        self.assertTrue(ep_enf["causal_coverage_valid"])
+
+        # 2. With enforce_causal_boundaries=False: pre-window starts at Week 6, but causal_coverage_valid is False
+        episodes_default = an.identify_promotion_episodes(
+            trends, min_promo_pct=50.0, pre_window=4, post_window=4, enforce_causal_boundaries=False
+        )
+        ep_def = episodes_default.iloc[0]
+        self.assertEqual(ep_def["pre_start_week_clean"], 6)
+        self.assertEqual(ep_def["pre_actual_weeks"], 4)
+        self.assertFalse(ep_def["causal_coverage_valid"])
+
+        # 3. Test compare_before_during_after detects unmonitored baseline
+        records = []
+        for wk in range(6, 10):
+            records.append({
+                "household_key": 1, "BASKET_ID": 100 + wk, "DAY": wk * 7,
+                "PRODUCT_ID": 101, "QUANTITY": 2, "SALES_VALUE": 4.0,
+                "STORE_ID": 501, "WEEK_NO": wk, "causal_coverage_status": "Unknown" if wk < 9 else "Recorded"
+            })
+        records.append({
+            "household_key": 1, "BASKET_ID": 200, "DAY": 70,
+            "PRODUCT_ID": 101, "QUANTITY": 10, "SALES_VALUE": 15.0,
+            "STORE_ID": 501, "WEEK_NO": 10, "causal_coverage_status": "Recorded"
+        })
+        records.append({
+            "household_key": 1, "BASKET_ID": 300, "DAY": 77,
+            "PRODUCT_ID": 101, "QUANTITY": 2, "SALES_VALUE": 4.0,
+            "STORE_ID": 501, "WEEK_NO": 11, "causal_coverage_status": "Recorded"
+        })
+        df_trans = pd.DataFrame(records)
+
+        bda_def = an.compare_before_during_after(df_trans, ep_def, use_clean_windows=True).iloc[0]
+        self.assertFalse(bda_def["causal_coverage_valid"])
+        self.assertFalse(bda_def["has_reliable_baseline"])
+        self.assertIn("Pre-promotion baseline includes weeks prior to Week 9", bda_def["coverage_warning"])
+
+        bda_enf = an.compare_before_during_after(df_trans, ep_enf, use_clean_windows=True).iloc[0]
+        self.assertTrue(bda_enf["causal_coverage_valid"])
+        self.assertTrue(bda_enf["has_reliable_baseline"])
+        self.assertEqual(bda_enf["coverage_warning"], "None")
+        self.assertEqual(bda_enf["pre_actual_weeks"], 1)
+
+    def test_late_promotion_episode_causal_boundaries(self):
+        """
+        Tests that promotion episodes near Week 101 truncate post-window at Week 101
+        when enforce_causal_boundaries=True and flag warnings when reaching Week 102.
+        """
+        trends = pd.DataFrame([
+            {"WEEK_NO": 100, "causal_promo_pct": 100.0, "is_promoted_week": True}
+        ])
+
+        # Enforced: post-window truncates to Week 101 (1 week)
+        episodes_enf = an.identify_promotion_episodes(
+            trends, min_promo_pct=50.0, pre_window=4, post_window=4, enforce_causal_boundaries=True
+        )
+        ep_enf = episodes_enf.iloc[0]
+        self.assertEqual(ep_enf["post_end_week_clean"], 101)
+        self.assertEqual(ep_enf["post_actual_weeks"], 1)
+        self.assertTrue(ep_enf["post_is_truncated"])
+        self.assertEqual(ep_enf["post_truncation_reason"], "Causal coverage end (Week 101)")
+        self.assertTrue(ep_enf["causal_coverage_valid"])
+
+        # Default: post-window extends to Week 102, causal_coverage_valid is False
+        episodes_def = an.identify_promotion_episodes(
+            trends, min_promo_pct=50.0, pre_window=4, post_window=4, enforce_causal_boundaries=False
+        )
+        ep_def = episodes_def.iloc[0]
+        self.assertEqual(ep_def["post_end_week_clean"], 102)
+        self.assertEqual(ep_def["post_actual_weeks"], 2)
+        self.assertFalse(ep_def["causal_coverage_valid"])
+
+    def test_missing_comparison_window_returns_nan_not_zero(self):
+        """
+        Regression Test: Verifies that when pre or post observation windows lack transaction data,
+        rates and percentage changes return np.nan rather than false 0.0 rates or false -100% dips.
+        """
+        # Promotion at Week 9: pre-window Weeks 5-8 is prior to causal tracking -> 0 clean pre-weeks
+        # Transactions only exist for Week 9 (no post transactions)
+        df_ep = pd.DataFrame([{
+            "household_key": 1, "BASKET_ID": 901, "DAY": 60,
+            "PRODUCT_ID": 101, "QUANTITY": 50, "SALES_VALUE": 100.0,
+            "STORE_ID": 501, "WEEK_NO": 9, "has_causal_evidence": True,
+            "total_discount_val": 25.0, "discount_depth_pct": 20.0,
+            "causal_coverage_status": "Recorded", "DEPARTMENT": "GROCERY",
+            "COMMODITY_DESC": "SOFT DRINKS", "SUB_COMMODITY_DESC": "COLA CAN"
+        }])
+        ep = {
+            "episode_id": "EP_01", "start_week": 9, "end_week": 9, "duration_weeks": 1,
+            "pre_actual_weeks": 0, "post_actual_weeks": 4,
+            "pre_start_week_clean": 9, "post_end_week_clean": 13,
+            "causal_coverage_valid": False
+        }
+        bda = an.compare_before_during_after(df_ep, ep, use_clean_windows=True).iloc[0]
+
+        # Pre has 0 observation weeks -> pre_units_per_week must be NaN, NOT 0.0
+        self.assertTrue(np.isnan(bda["pre_units_per_week"]))
+        self.assertTrue(np.isnan(bda["unit_lift_pct"]))
+
+        # Post has 0 recorded transactions -> post_units_per_week and dip must be NaN, NOT -100.0%
+        self.assertTrue(np.isnan(bda["post_units_per_week"]))
+        self.assertTrue(np.isnan(bda["post_vs_during_dip_pct"]))
+        self.assertTrue(np.isnan(bda["post_vs_pre_unit_pct"]))
+
+    def test_event_log_does_not_create_93_week_episode(self):
+        """
+        Regression Test: Verifies that when causal tracking follows an event-log pattern
+        (only promoted transactions have causal_coverage_status='Recorded', while baseline
+        transactions lack causal records), isolated promotions do not get coalesced into
+        a single continuous 93-week episode across Weeks 9-101.
+        """
+        records = []
+        for wk in range(9, 102):
+            if wk in [10, 25]:
+                # True promotion weeks: 100% promoted
+                for i in range(10):
+                    records.append({
+                        "household_key": 100 + i, "BASKET_ID": 1000 + i, "DAY": wk * 7,
+                        "PRODUCT_ID": 101, "QUANTITY": 10, "SALES_VALUE": 20.0,
+                        "STORE_ID": 501, "WEEK_NO": wk, "has_causal_evidence": True,
+                        "total_discount_val": 5.0, "discount_depth_pct": 20.0,
+                        "causal_coverage_status": "Recorded", "DEPARTMENT": "GROCERY",
+                        "COMMODITY_DESC": "SOFT DRINKS", "SUB_COMMODITY_DESC": "COLA CAN"
+                    })
+            elif 11 <= wk <= 15:
+                # Weeks with low background activity (1 out of 10 = 10% promo rate < 25% threshold)
+                records.append({
+                    "household_key": 200, "BASKET_ID": 2000, "DAY": wk * 7,
+                    "PRODUCT_ID": 101, "QUANTITY": 2, "SALES_VALUE": 4.0,
+                    "STORE_ID": 501, "WEEK_NO": wk, "has_causal_evidence": True,
+                    "total_discount_val": 1.0, "discount_depth_pct": 20.0,
+                    "causal_coverage_status": "Recorded", "DEPARTMENT": "GROCERY",
+                    "COMMODITY_DESC": "SOFT DRINKS", "SUB_COMMODITY_DESC": "COLA CAN"
+                })
+                for i in range(1, 10):
+                    records.append({
+                        "household_key": 200 + i, "BASKET_ID": 2000 + i, "DAY": wk * 7,
+                        "PRODUCT_ID": 101, "QUANTITY": 2, "SALES_VALUE": 5.0,
+                        "STORE_ID": 501, "WEEK_NO": wk, "has_causal_evidence": False,
+                        "total_discount_val": 0.0, "discount_depth_pct": 0.0,
+                        "causal_coverage_status": "Unknown", "DEPARTMENT": "GROCERY",
+                        "COMMODITY_DESC": "SOFT DRINKS", "SUB_COMMODITY_DESC": "COLA CAN"
+                    })
+            else:
+                # Quiet baseline weeks: 0 promoted transactions
+                for i in range(10):
+                    records.append({
+                        "household_key": 300 + i, "BASKET_ID": 3000 + i, "DAY": wk * 7,
+                        "PRODUCT_ID": 101, "QUANTITY": 2, "SALES_VALUE": 5.0,
+                        "STORE_ID": 501, "WEEK_NO": wk, "has_causal_evidence": False,
+                        "total_discount_val": 0.0, "discount_depth_pct": 0.0,
+                        "causal_coverage_status": "Unknown", "DEPARTMENT": "GROCERY",
+                        "COMMODITY_DESC": "SOFT DRINKS", "SUB_COMMODITY_DESC": "COLA CAN"
+                    })
+
+        df_log = pd.DataFrame(records)
+        trends = an.get_weekly_trends(df_log, min_week=9, max_week=101, promo_threshold_pct=25.0)
+
+        # Weeks 11-15 should be 10% promo rate (<25% threshold) and NOT marked as promoted
+        w12 = trends[trends["WEEK_NO"] == 12].iloc[0]
+        self.assertAlmostEqual(w12["causal_promo_pct"], 10.0)
+        self.assertFalse(w12["is_promoted_week"])
+
+        # Week 10 and Week 25 should be 100% promo rate and marked promoted
+        w10 = trends[trends["WEEK_NO"] == 10].iloc[0]
+        self.assertAlmostEqual(w10["causal_promo_pct"], 100.0)
+        self.assertTrue(w10["is_promoted_week"])
+
+        # Episodes must identify discrete episodes (Week 10 and Week 25), NOT a single 93-week episode
+        episodes = an.identify_promotion_episodes(trends, min_promo_pct=25.0)
+        self.assertEqual(len(episodes), 2)
+        self.assertEqual(episodes.iloc[0]["start_week"], 10)
+        self.assertEqual(episodes.iloc[0]["end_week"], 10)
+        self.assertEqual(episodes.iloc[0]["duration_weeks"], 1)
+        self.assertEqual(episodes.iloc[1]["start_week"], 25)
+        self.assertEqual(episodes.iloc[1]["end_week"], 25)
+        self.assertEqual(episodes.iloc[1]["duration_weeks"], 1)
 
 
 if __name__ == "__main__":

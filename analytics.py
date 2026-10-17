@@ -76,7 +76,8 @@ def get_weekly_trends(
     include_returns=False,
     min_week=1,
     max_week=102,
-    promo_threshold_pct=25.0
+    promo_threshold_pct=25.0,
+    min_coverage_pct=100.0
 ):
     """
     Calculates consolidated weekly trend metrics across native WEEK_NO (1 to 102).
@@ -93,9 +94,11 @@ def get_weekly_trends(
     - total_discount_val: sum of total_discount_val
     - avg_discount_depth_pct: weighted average discount depth
     - causal_promoted_trans_count: transactions with has_causal_evidence == True
-    - causal_promo_pct: percentage of transactions with causal promotion
+    - causal_promo_pct: percentage of transactions with causal promotion (NaN if coverage unknown)
     - is_promoted_week: boolean indicating promotion active this week
     - causal_coverage_status: 'Recorded', 'Mixed', or 'Unknown'
+    - promo_evaluation_status: 'Promoted', 'Unpromoted' (only when coverage adequate), or 'Unknown'
+    - causal_coverage_pct: percentage of transactions with recorded causal tracking
     
     Returns a DataFrame sorted by WEEK_NO ready for Streamlit charts.
     """
@@ -105,7 +108,7 @@ def get_weekly_trends(
         "baskets_per_household", "avg_unit_price", "total_discount_val",
         "avg_discount_depth_pct", "causal_promoted_trans_count",
         "total_transactions", "causal_promo_pct", "is_promoted_week",
-        "causal_coverage_status"
+        "causal_coverage_status", "promo_evaluation_status", "causal_coverage_pct"
     ]
     if df is None or len(df) == 0:
         return pd.DataFrame(columns=cols)
@@ -141,20 +144,68 @@ def get_weekly_trends(
             disc_val = float(w_df["total_discount_val"].sum()) if "total_discount_val" in w_df.columns else 0.0
             disc_pct = float(w_df["discount_depth_pct"].mean()) if "discount_depth_pct" in w_df.columns else 0.0
             
-            causal_count = int(w_df["has_causal_evidence"].sum()) if "has_causal_evidence" in w_df.columns else 0
-            promo_pct = (causal_count / n_trans * 100.0) if n_trans > 0 else 0.0
-            is_promo = promo_pct >= promo_threshold_pct
-            
+            # Causal coverage completeness
             if "causal_coverage_status" in w_df.columns:
-                cov_set = set(w_df["causal_coverage_status"].unique())
+                cov_set = set(w_df["causal_coverage_status"].dropna().unique())
+                n_recorded = int((w_df["causal_coverage_status"] == "Recorded").sum())
+                cov_pct = (n_recorded / n_trans * 100.0) if n_trans > 0 else 0.0
                 if cov_set == {"Recorded"}:
                     cov_status = "Recorded"
                 elif "Recorded" in cov_set:
                     cov_status = "Mixed"
                 else:
-                    cov_status = "Unknown"
+                    if 9 <= week <= 101:
+                        cov_status = "Recorded"
+                        cov_pct = 100.0
+                    else:
+                        cov_status = "Unknown"
             else:
-                cov_status = "Recorded" if (9 <= week <= 101) else "Unknown"
+                if 9 <= week <= 101:
+                    cov_status = "Recorded"
+                    cov_pct = 100.0
+                    n_recorded = n_trans
+                else:
+                    cov_status = "Unknown"
+                    cov_pct = 0.0
+                    n_recorded = 0
+
+            # Causal promotion rate calculation
+            if "has_causal_evidence" in w_df.columns:
+                if cov_status == "Mixed":
+                    # If recorded transactions include both promoted and unpromoted items (audited subset)
+                    rec_mask = (w_df["causal_coverage_status"] == "Recorded")
+                    causal_count = int(w_df.loc[rec_mask, "has_causal_evidence"].sum())
+                    if n_recorded > causal_count:
+                        promo_pct = (causal_count / n_recorded * 100.0) if n_recorded > 0 else np.nan
+                    else:
+                        # Dunnhumby causal records represent promotional event logs (only active displays/mailers logged).
+                        # Unfeatured items in audited weeks have no causal record; denominator is total transactions.
+                        promo_pct = (causal_count / n_trans * 100.0) if n_trans > 0 else np.nan
+                elif cov_status == "Recorded":
+                    causal_count = int(w_df["has_causal_evidence"].sum())
+                    promo_pct = (causal_count / n_trans * 100.0) if n_trans > 0 else np.nan
+                else:
+                    causal_count = 0
+                    promo_pct = np.nan
+            else:
+                causal_count = 0
+                promo_pct = np.nan if cov_status == "Unknown" else 0.0
+
+            is_promo = bool(promo_pct >= promo_threshold_pct) if (promo_pct is not None and not np.isnan(promo_pct)) else False
+
+            # Evaluation status distinguishing Promoted, Unpromoted (adequate coverage), and Unknown
+            if is_promo:
+                promo_eval = "Promoted"
+            elif cov_status == "Unknown":
+                promo_eval = "Unknown"
+            elif cov_status == "Mixed":
+                if n_recorded > causal_count:
+                    promo_eval = "Unpromoted" if cov_pct >= min_coverage_pct else "Unknown"
+                else:
+                    # In Dunnhumby event-log data, absence of causal record indicates unfeatured/unpromoted
+                    promo_eval = "Unpromoted"
+            else:
+                promo_eval = "Unpromoted"
 
             records.append({
                 "WEEK_NO": week,
@@ -172,10 +223,13 @@ def get_weekly_trends(
                 "total_transactions": n_trans,
                 "causal_promo_pct": promo_pct,
                 "is_promoted_week": is_promo,
-                "causal_coverage_status": cov_status
+                "causal_coverage_status": cov_status,
+                "promo_evaluation_status": promo_eval,
+                "causal_coverage_pct": cov_pct
             })
         else:
             cov_status = "Recorded" if (9 <= week <= 101) else "Unknown"
+            cov_pct = 100.0 if (9 <= week <= 101) else 0.0
             records.append({
                 "WEEK_NO": week,
                 "total_units": 0.0,
@@ -190,9 +244,11 @@ def get_weekly_trends(
                 "avg_discount_depth_pct": 0.0,
                 "causal_promoted_trans_count": 0,
                 "total_transactions": 0,
-                "causal_promo_pct": 0.0,
+                "causal_promo_pct": np.nan,
                 "is_promoted_week": False,
-                "causal_coverage_status": cov_status
+                "causal_coverage_status": cov_status,
+                "promo_evaluation_status": "Unknown",
+                "causal_coverage_pct": cov_pct
             })
 
     return pd.DataFrame(records)
@@ -206,7 +262,8 @@ def identify_promotion_episodes(
     weekly_trends_df,
     min_promo_pct=25.0,
     pre_window=4,
-    post_window=4
+    post_window=4,
+    enforce_causal_boundaries=False
 ):
     """
     Identifies promotion episodes by grouping consecutive promotion weeks.
@@ -218,6 +275,8 @@ def identify_promotion_episodes(
     - Pre-window is truncated to start AFTER any preceding promotion ends.
     - Post-window is truncated to end BEFORE any subsequent promotion starts.
     - Boundary checks enforce Week 1 and Week 102 dataset limits.
+    - When enforce_causal_boundaries=True, pre/post windows are additionally truncated
+      to remain strictly within the verified causal tracking window (Weeks 9-101).
     - Reports both nominal and actual clean week counts, with explicit truncation reasons.
     
     Returns a DataFrame of candidate promotion episodes.
@@ -232,7 +291,8 @@ def identify_promotion_episodes(
         "pre_is_truncated", "post_is_truncated",
         "pre_truncation_reason", "post_truncation_reason",
         "is_complete_window", "has_overlapping_promo",
-        "causal_coverage_valid", "during_avg_promo_pct"
+        "causal_coverage_valid", "during_avg_promo_pct",
+        "enforce_causal_boundaries"
     ]
     if weekly_trends_df is None or len(weekly_trends_df) == 0:
         return pd.DataFrame(columns=cols)
@@ -282,7 +342,11 @@ def identify_promotion_episodes(
                 pre_is_trunc = True
                 pre_trunc_reason = f"Prior promotion at Week {prior_end}"
 
-        if pre_s_clean < 1:
+        if enforce_causal_boundaries and pre_s_clean < 9:
+            pre_s_clean = 9
+            pre_is_trunc = True
+            pre_trunc_reason = "Causal coverage start (Week 9)"
+        elif pre_s_clean < 1:
             pre_s_clean = 1
             pre_is_trunc = True
             pre_trunc_reason = "Dataset start (Week 1)"
@@ -299,7 +363,11 @@ def identify_promotion_episodes(
                 post_is_trunc = True
                 post_trunc_reason = f"Subsequent promotion at Week {next_start}"
 
-        if post_e_clean > 102:
+        if enforce_causal_boundaries and post_e_clean > 101:
+            post_e_clean = 101
+            post_is_trunc = True
+            post_trunc_reason = "Causal coverage end (Week 101)"
+        elif post_e_clean > 102:
             post_e_clean = 102
             post_is_trunc = True
             post_trunc_reason = "Dataset end (Week 102)"
@@ -313,7 +381,7 @@ def identify_promotion_episodes(
         is_comp_window = is_comp_pre and is_comp_post
 
         has_ov = pre_is_trunc or post_is_trunc
-        causal_valid = (pre_s_clean >= 9) and (post_e_clean <= 101)
+        causal_valid = (s_wk >= 9) and (e_wk <= 101) and (pre_s_clean >= 9) and (post_e_clean <= 101) and (pre_act_wks > 0 or pre_window == 0) and (post_act_wks > 0 or post_window == 0)
 
         # Average promo intensity during episode
         ep_slice = df_sorted[df_sorted["WEEK_NO"].isin(ep_weeks)]
@@ -341,7 +409,8 @@ def identify_promotion_episodes(
             "is_complete_window": is_comp_window,
             "has_overlapping_promo": has_ov,
             "causal_coverage_valid": causal_valid,
-            "during_avg_promo_pct": avg_intensity
+            "during_avg_promo_pct": avg_intensity,
+            "enforce_causal_boundaries": enforce_causal_boundaries
         })
 
     return pd.DataFrame(episodes)
@@ -355,7 +424,8 @@ def compare_before_during_after(
     df,
     episode,
     use_clean_windows=True,
-    include_returns=False
+    include_returns=False,
+    enforce_causal_boundaries=False
 ):
     """
     Computes Before, During, and After summary metrics for a given promotion episode.
@@ -371,6 +441,9 @@ def compare_before_during_after(
     - Promotional Lift % (During vs Pre)
     - Post-Promotion Persistence / Dip % (Post vs Pre, and Post vs During)
     - is_clean_comparison: True if both pre and post have >= 1 clean unpromoted week
+    - causal_coverage_valid: True if all evaluated weeks fall strictly in Weeks 9-101
+    - has_reliable_baseline: True if baseline is clean, positive, and within verified causal coverage
+    - coverage_warning: Human-readable warning if comparison contains unknown causal coverage
     
     Returns a single-row DataFrame ready for Streamlit KPI cards / summary tables.
     """
@@ -382,15 +455,23 @@ def compare_before_during_after(
     dur_wks = int(episode["duration_weeks"])
 
     if use_clean_windows:
-        pre_s = int(episode.get("pre_start_week_clean", episode["pre_start_week_nominal"]))
-        post_e = int(episode.get("post_end_week_clean", episode["post_end_week_nominal"]))
-        pre_wks = int(episode.get("pre_actual_weeks", max(0, dur_s - pre_s)))
-        post_wks = int(episode.get("post_actual_weeks", max(0, post_e - dur_e)))
+        pre_s = int(episode.get("pre_start_week_clean", episode.get("pre_start_week_nominal", dur_s - 4)))
+        post_e = int(episode.get("post_end_week_clean", episode.get("post_end_week_nominal", dur_e + 4)))
+        pre_wks = int(episode.get("pre_actual_weeks", max(0, (dur_s - 1) - pre_s + 1)))
+        post_wks = int(episode.get("post_actual_weeks", max(0, post_e - (dur_e + 1) + 1)))
     else:
-        pre_s = int(episode["pre_start_week_nominal"])
-        post_e = int(episode["post_end_week_nominal"])
+        pre_s = int(episode.get("pre_start_week_nominal", dur_s - 4))
+        post_e = int(episode.get("post_end_week_nominal", dur_e + 4))
         pre_wks = max(1, dur_s - max(1, pre_s))
         post_wks = max(1, min(102, post_e) - dur_e)
+
+    if enforce_causal_boundaries:
+        if pre_s < 9:
+            pre_s = 9
+            pre_wks = max(0, (dur_s - 1) - pre_s + 1)
+        if post_e > 101:
+            post_e = 101
+            post_wks = max(0, post_e - (dur_e + 1) + 1)
 
     pre_e = dur_s - 1
     post_s = dur_e + 1
@@ -406,17 +487,50 @@ def compare_before_during_after(
     dur_df = data[(data["WEEK_NO"] >= dur_s) & (data["WEEK_NO"] <= dur_e)]
     post_df = data[(data["WEEK_NO"] >= post_s) & (data["WEEK_NO"] <= post_e)] if post_wks > 0 else pd.DataFrame(columns=data.columns)
 
+    # Coverage inspection
+    pre_has_unknown = (pre_s < 9)
+    post_has_unknown = (post_e > 101)
+    if len(pre_df) > 0 and "causal_coverage_status" in pre_df.columns:
+        if ((pre_df["causal_coverage_status"] == "Unknown") & (pre_df["WEEK_NO"] < 9)).any():
+            pre_has_unknown = True
+    if len(post_df) > 0 and "causal_coverage_status" in post_df.columns:
+        if ((post_df["causal_coverage_status"] == "Unknown") & (post_df["WEEK_NO"] > 101)).any():
+            post_has_unknown = True
+
+    episode_causal_valid = bool(episode.get("causal_coverage_valid", True))
+    causal_valid = episode_causal_valid and (not pre_has_unknown) and (not post_has_unknown) and (dur_s >= 9) and (dur_e <= 101)
+
+    if pre_has_unknown and post_has_unknown:
+        cov_warning = "Both pre-baseline (Weeks < 9) and post-window (Weeks > 101) contain unknown causal coverage."
+    elif pre_has_unknown:
+        cov_warning = "Pre-promotion baseline includes weeks prior to Week 9 with unknown causal coverage."
+    elif post_has_unknown:
+        cov_warning = "Post-promotion window includes weeks beyond Week 101 with unknown causal coverage."
+    elif dur_s < 9 or dur_e > 101:
+        cov_warning = "Promotion episode is outside verified causal coverage period (Weeks 9-101)."
+    elif not episode_causal_valid:
+        cov_warning = "Episode was flagged with invalid causal coverage."
+    elif pre_wks == 0:
+        cov_warning = "Pre-promotion baseline has 0 observation weeks."
+    elif post_wks == 0:
+        cov_warning = "Post-promotion window has 0 observation weeks."
+    else:
+        cov_warning = "None"
+
+    is_reliable_baseline = bool(causal_valid and pre_wks > 0)
+    is_clean = (pre_wks > 0) and (post_wks > 0)
+
     def _metrics(sub_df, num_weeks):
-        if len(sub_df) == 0 or num_weeks == 0:
-            return 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0
+        if num_weeks == 0 or len(sub_df) == 0:
+            return np.nan, np.nan, np.nan, np.nan, np.nan, 0, 0
         tot_u = float(sub_df["QUANTITY"].sum())
         tot_s = float(sub_df["SALES_VALUE"].sum())
         hh = int(sub_df["household_key"].nunique())
         u_per_wk = tot_u / num_weeks
         s_per_wk = tot_s / num_weeks
         hh_per_wk = hh / num_weeks
-        u_per_hh = tot_u / hh if hh > 0 else 0.0
-        s_per_hh = tot_s / hh if hh > 0 else 0.0
+        u_per_hh = tot_u / hh if hh > 0 else np.nan
+        s_per_hh = tot_s / hh if hh > 0 else np.nan
         return u_per_wk, s_per_wk, hh_per_wk, u_per_hh, s_per_hh, hh, tot_u
 
     pre_u_wk, pre_s_wk, pre_hh_wk, pre_u_hh, pre_s_hh, pre_hh, pre_tot_u = _metrics(pre_df, pre_wks)
@@ -424,17 +538,15 @@ def compare_before_during_after(
     post_u_wk, post_s_wk, post_hh_wk, post_u_hh, post_s_hh, post_hh, post_tot_u = _metrics(post_df, post_wks)
 
     def _pct_change(new_val, base_val):
-        if base_val == 0.0:
+        if pd.isna(base_val) or pd.isna(new_val) or base_val == 0.0:
             return np.nan
         return ((new_val - base_val) / base_val) * 100.0
 
-    unit_lift_pct = _pct_change(dur_u_wk, pre_u_wk) if pre_wks > 0 else np.nan
-    sales_lift_pct = _pct_change(dur_s_wk, pre_s_wk) if pre_wks > 0 else np.nan
-    hh_lift_pct = _pct_change(dur_hh_wk, pre_hh_wk) if pre_wks > 0 else np.nan
-    post_vs_pre_unit_pct = _pct_change(post_u_wk, pre_u_wk) if (pre_wks > 0 and post_wks > 0) else np.nan
-    post_vs_during_dip_pct = _pct_change(post_u_wk, dur_u_wk) if post_wks > 0 else np.nan
-
-    is_clean = (pre_wks > 0) and (post_wks > 0)
+    unit_lift_pct = _pct_change(dur_u_wk, pre_u_wk) if (pre_wks > 0 and len(pre_df) > 0) else np.nan
+    sales_lift_pct = _pct_change(dur_s_wk, pre_s_wk) if (pre_wks > 0 and len(pre_df) > 0) else np.nan
+    hh_lift_pct = _pct_change(dur_hh_wk, pre_hh_wk) if (pre_wks > 0 and len(pre_df) > 0) else np.nan
+    post_vs_pre_unit_pct = _pct_change(post_u_wk, pre_u_wk) if (pre_wks > 0 and post_wks > 0 and len(pre_df) > 0 and len(post_df) > 0) else np.nan
+    post_vs_during_dip_pct = _pct_change(post_u_wk, dur_u_wk) if (post_wks > 0 and len(post_df) > 0 and len(dur_df) > 0) else np.nan
 
     result = {
         "episode_id": episode.get("episode_id", "EP_01"),
@@ -449,7 +561,9 @@ def compare_before_during_after(
         "post_truncation_reason": episode.get("post_truncation_reason", "None"),
         "is_clean_comparison": is_clean,
         "is_complete_window": episode.get("is_complete_window", True),
-        "causal_coverage_valid": episode.get("causal_coverage_valid", True),
+        "causal_coverage_valid": causal_valid,
+        "has_reliable_baseline": is_reliable_baseline,
+        "coverage_warning": cov_warning,
         # Pre metrics
         "pre_units_per_week": pre_u_wk,
         "pre_sales_per_week": pre_s_wk,
@@ -489,7 +603,8 @@ def get_household_behavior_summary(
     df,
     episode,
     use_clean_windows=True,
-    include_returns=False
+    include_returns=False,
+    enforce_causal_boundaries=False
 ):
     """
     Analyzes household cohort behavior and repurchase timing using native DAY.
@@ -508,6 +623,9 @@ def get_household_behavior_summary(
     - avg_post_interpurchase_days: mean days between repeat trips in post-window (DAY)
     - interpurchase_day_change: post_days - pre_days
       (Negative value indicates faster / shorter repeat cycle, NOT delayed repurchase).
+    - causal_coverage_valid: boolean indicating if evaluated windows fall in Weeks 9-101
+    - has_reliable_baseline: boolean indicating reliable pre-promotion baseline
+    - coverage_warning: warning message if coverage is unmonitored or insufficient
     
     Returns a single-row DataFrame.
     """
@@ -528,6 +646,14 @@ def get_household_behavior_summary(
         pre_wks = max(1, dur_s - max(1, pre_s))
         post_wks = max(1, min(102, post_e) - dur_e)
 
+    if enforce_causal_boundaries:
+        if pre_s < 9:
+            pre_s = 9
+            pre_wks = max(0, (dur_s - 1) - pre_s + 1)
+        if post_e > 101:
+            post_e = 101
+            post_wks = max(0, post_e - (dur_e + 1) + 1)
+
     pre_e = dur_s - 1
     post_s = dur_e + 1
 
@@ -539,6 +665,34 @@ def get_household_behavior_summary(
     pre_data = data[(data["WEEK_NO"] >= pre_s) & (data["WEEK_NO"] <= pre_e)] if pre_wks > 0 else pd.DataFrame(columns=data.columns)
     dur_data = data[(data["WEEK_NO"] >= dur_s) & (data["WEEK_NO"] <= dur_e)]
     post_data = data[(data["WEEK_NO"] >= post_s) & (data["WEEK_NO"] <= post_e)] if post_wks > 0 else pd.DataFrame(columns=data.columns)
+
+    # Coverage inspection
+    pre_has_unknown = (pre_s < 9)
+    post_has_unknown = (post_e > 101)
+    if len(pre_data) > 0 and "causal_coverage_status" in pre_data.columns:
+        if ((pre_data["causal_coverage_status"] == "Unknown") & (pre_data["WEEK_NO"] < 9)).any():
+            pre_has_unknown = True
+    if len(post_data) > 0 and "causal_coverage_status" in post_data.columns:
+        if ((post_data["causal_coverage_status"] == "Unknown") & (post_data["WEEK_NO"] > 101)).any():
+            post_has_unknown = True
+
+    episode_causal_valid = bool(episode.get("causal_coverage_valid", True))
+    causal_valid = episode_causal_valid and (not pre_has_unknown) and (not post_has_unknown) and (dur_s >= 9) and (dur_e <= 101)
+
+    if pre_has_unknown and post_has_unknown:
+        cov_warning = "Both pre-baseline (Weeks < 9) and post-window (Weeks > 101) contain unknown causal coverage."
+    elif pre_has_unknown:
+        cov_warning = "Pre-promotion baseline includes weeks prior to Week 9 with unknown causal coverage."
+    elif post_has_unknown:
+        cov_warning = "Post-promotion window includes weeks beyond Week 101 with unknown causal coverage."
+    elif dur_s < 9 or dur_e > 101:
+        cov_warning = "Promotion episode is outside verified causal coverage period (Weeks 9-101)."
+    elif not episode_causal_valid:
+        cov_warning = "Episode was flagged with invalid causal coverage."
+    else:
+        cov_warning = "None"
+
+    is_reliable_baseline = bool(causal_valid and pre_wks > 0)
 
     pre_hh_set = set(pre_data["household_key"].unique())
     dur_hh_set = set(dur_data["household_key"].unique())
@@ -560,7 +714,10 @@ def get_household_behavior_summary(
             "pre_cycle_sample_size": 0,
             "avg_post_interpurchase_days": np.nan,
             "post_cycle_sample_size": 0,
-            "interpurchase_day_change": np.nan
+            "interpurchase_day_change": np.nan,
+            "causal_coverage_valid": causal_valid,
+            "has_reliable_baseline": is_reliable_baseline,
+            "coverage_warning": cov_warning
         }])
 
     repeat_hh = dur_hh_set.intersection(post_hh_set)
@@ -614,6 +771,9 @@ def get_household_behavior_summary(
         "pre_cycle_sample_size": pre_n,
         "avg_post_interpurchase_days": post_interval,
         "post_cycle_sample_size": post_n,
-        "interpurchase_day_change": interval_change
+        "interpurchase_day_change": interval_change,
+        "causal_coverage_valid": causal_valid,
+        "has_reliable_baseline": is_reliable_baseline,
+        "coverage_warning": cov_warning
     }
     return pd.DataFrame([result])

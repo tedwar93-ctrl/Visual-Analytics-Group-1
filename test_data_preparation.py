@@ -160,5 +160,105 @@ class TestDataPreparation(unittest.TestCase):
         self.assertTrue((joined["WEEK_NO"] == self.mock_transactions["WEEK_NO"]).all())
 
 
+class TestAggregateCausalDataNoMatchMessage(unittest.TestCase):
+    """Tests the contextual message branch in aggregate_causal_data() when no records match."""
+
+    def _make_target_keys(self, pid_arr, store_arr, week_arr):
+        """Helper to produce sorted encoded keys matching dp.encode_psw_key()."""
+        return np.sort(np.unique(dp.encode_psw_key(
+            np.array(pid_arr, dtype=np.int64),
+            np.array(store_arr, dtype=np.int64),
+            np.array(week_arr, dtype=np.int64),
+        )))
+
+    def _run_with_mock_csv(self, mock_csv_content, target_keys, capture_stdout=True):
+        """
+        Run aggregate_causal_data against a tiny mock CSV string and return
+        (result_df, printed_output).  Uses a temp file to avoid touching raw data.
+        """
+        import io
+        import tempfile
+        from unittest.mock import patch
+
+        # Write mock CSV to a temp file
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
+            f.write(mock_csv_content)
+            tmp_path = f.name
+
+        captured = io.StringIO()
+        try:
+            with patch("sys.stdout", captured):
+                result = dp.aggregate_causal_data(
+                    causal_filepath=tmp_path,
+                    target_keys_sorted=target_keys,
+                    chunk_size=10_000,
+                )
+        finally:
+            import os
+            os.unlink(tmp_path)
+
+        return result, captured.getvalue()
+
+    MOCK_CAUSAL_WEEKS_9_PLUS = (
+        "PRODUCT_ID,STORE_ID,WEEK_NO,display,mailer\n"
+        "101,500,10,0,A\n"
+        "102,501,15,1,D\n"
+    )
+
+    def test_weeks_1_to_8_only_prints_notice(self):
+        """All target keys in Weeks 1-8 must print the informational Notice, not a Warning."""
+        # Keys all in weeks 1-8 — no possible causal match
+        target_keys = self._make_target_keys([101, 102], [500, 501], [1, 8])
+        result, output = self._run_with_mock_csv(self.MOCK_CAUSAL_WEEKS_9_PLUS, target_keys)
+
+        self.assertIn("Notice:", output)
+        self.assertIn("Weeks 1", output)
+        self.assertIn("Week 9", output)
+        self.assertNotIn("Warning:", output)
+        self.assertEqual(len(result), 0)
+
+    def test_covered_weeks_with_no_match_prints_warning(self):
+        """Target keys spanning covered weeks but with no overlap must print a Warning."""
+        # Keys in weeks 10-12 but no matching products in mock CSV (PIDs 999, 998)
+        target_keys = self._make_target_keys([999, 998], [999, 998], [10, 12])
+        result, output = self._run_with_mock_csv(self.MOCK_CAUSAL_WEEKS_9_PLUS, target_keys)
+
+        self.assertIn("Warning:", output)
+        self.assertNotIn("Notice:", output)
+        self.assertEqual(len(result), 0)
+
+    def test_no_filter_path_prints_warning(self):
+        """When target_keys_sorted is supplied and covered-week keys exist but no rows match, Warning is printed.
+
+        Note: When target_keys_sorted=None, aggregate_causal_data() always appends every chunk
+        (the else branch at line ~106), so an empty CSV goes through groupby which yields an
+        empty DataFrame, not the no-match branch.  The Warning code path for the unfiltered case
+        is therefore unreachable with an empty CSV; we test the filtered-but-no-match path instead.
+        """
+        # Keys in covered weeks but no product/store/week overlap with mock CSV
+        target_keys = self._make_target_keys([888, 777], [888, 777], [9, 11])
+        result, output = self._run_with_mock_csv(self.MOCK_CAUSAL_WEEKS_9_PLUS, target_keys)
+
+        self.assertIn("Warning:", output)
+        self.assertNotIn("Notice:", output)
+        self.assertEqual(len(result), 0)
+
+    def test_mixed_weeks_with_matching_returns_results(self):
+        """Target keys spanning both pre-causal and causal weeks that DO match return aggregated rows."""
+        # Include WEEK=10 for PID=101/STORE=500 to match the CSV row (PID=101, STORE=500, WEEK=10)
+        # Also include a pre-causal key (WEEK=1) and a non-matching covered key
+        target_keys = self._make_target_keys(
+            [101, 101, 9999],
+            [500, 500, 999],
+            [1,   10,  11],   # WEEK=10 matches CSV entry for PID=101/STORE=500
+        )
+        result, output = self._run_with_mock_csv(self.MOCK_CAUSAL_WEEKS_9_PLUS, target_keys)
+
+        # PID=101, STORE=500, WEEK=10 must be found in the mock CSV
+        self.assertGreater(len(result), 0)
+        self.assertNotIn("Warning:", output)
+        self.assertNotIn("Notice:", output)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2,6 +2,10 @@
 database/causal_data.csv
 database/transaction_data.csv
 
+# Processed Parquet datasets
+database/*.parquet
+*.parquet
+
 # Python cache
 __pycache__/
 *.pyc
@@ -9,3 +13,8 @@ __pycache__/
 # Virtual environments
 .venv/
 venv/
+# Local backups
+*.backup
+
+# Streamlit cache
+.streamlit/secrets.toml
