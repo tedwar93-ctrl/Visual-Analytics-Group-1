@@ -670,6 +670,142 @@ class TestAnalytics(unittest.TestCase):
         self.assertEqual(episodes.iloc[1]["end_week"], 25)
         self.assertEqual(episodes.iloc[1]["duration_weeks"], 1)
 
+    # --------------------------------------------------------------------------
+    # Opportunity Feature: Explore Similar Products Tests
+    # --------------------------------------------------------------------------
+
+    def test_similar_products_commodity_restriction(self):
+        """Verify summary returns only products belonging to requested commodity."""
+        df_test = pd.DataFrame({
+            "COMMODITY_DESC": ["SOFT DRINKS", "SOFT DRINKS", "POTATOES", "COLD CEREAL"],
+            "PRODUCT_ID": [101, 102, 201, 301],
+            "QUANTITY": [5, 10, 2, 4],
+            "SALES_VALUE": [10.0, 15.0, 4.0, 12.0],
+            "household_key": [1, 2, 3, 4],
+            "WEEK_NO": [10, 10, 10, 10],
+            "has_causal_evidence": [False, True, False, False],
+            "SUB_COMMODITY_DESC": ["COLA", "DIET COLA", "RUSSET", "FLAKES"],
+            "BRAND": ["National", "National", "Private", "National"],
+            "CURR_SIZE_OF_PRODUCT": ["12 PK", "2 LTR", "5 LB", "18 OZ"]
+        })
+        summary = an.get_similar_products_summary(df_test, "SOFT DRINKS")
+        self.assertEqual(len(summary), 2)
+        self.assertSetEqual(set(summary["PRODUCT_ID"].tolist()), {101, 102})
+        self.assertNotIn(201, summary["PRODUCT_ID"].values)
+        self.assertNotIn(301, summary["PRODUCT_ID"].values)
+
+    def test_similar_products_focal_identification_and_inclusion(self):
+        """Verify focal product is marked is_focal=True and included even if ranked outside top_n."""
+        df_test = pd.DataFrame({
+            "COMMODITY_DESC": ["SOFT DRINKS"] * 4,
+            "PRODUCT_ID": [101, 102, 103, 104],
+            "QUANTITY": [100, 80, 60, 20],  # 104 ranks 4th
+            "SALES_VALUE": [200.0, 160.0, 120.0, 40.0],
+            "household_key": [1, 2, 3, 4],
+            "WEEK_NO": [10, 10, 10, 10],
+            "has_causal_evidence": [False, False, False, False],
+            "SUB_COMMODITY_DESC": ["SODA"] * 4,
+            "BRAND": ["National"] * 4,
+            "CURR_SIZE_OF_PRODUCT": ["12 PK"] * 4
+        })
+        # Top 2 products requested, but focal product is 104 (ranks 4th)
+        summary = an.get_similar_products_summary(df_test, "SOFT DRINKS", current_product_id=104, top_n=2)
+        # Should contain top 2 (101, 102) PLUS focal product 104
+        self.assertEqual(len(summary), 3)
+        focal_row = summary[summary["PRODUCT_ID"] == 104]
+        self.assertEqual(len(focal_row), 1)
+        self.assertTrue(bool(focal_row.iloc[0]["is_focal"]))
+        self.assertFalse(summary[summary["PRODUCT_ID"] == 101].iloc[0]["is_focal"])
+
+    def test_similar_products_hand_checkable_aggregates(self):
+        """Verify units, sales, and average unit price match exact calculations."""
+        df_test = pd.DataFrame({
+            "COMMODITY_DESC": ["SOFT DRINKS", "SOFT DRINKS"],
+            "PRODUCT_ID": [101, 101],
+            "QUANTITY": [3, 7],
+            "SALES_VALUE": [6.00, 14.00],
+            "household_key": [1, 2],
+            "WEEK_NO": [10, 11],
+            "has_causal_evidence": [False, False],
+            "SUB_COMMODITY_DESC": ["COLA", "COLA"],
+            "BRAND": ["National", "National"],
+            "CURR_SIZE_OF_PRODUCT": ["12 PK", "12 PK"]
+        })
+        summary = an.get_similar_products_summary(df_test, "SOFT DRINKS", current_product_id=101)
+        self.assertEqual(len(summary), 1)
+        row = summary.iloc[0]
+        self.assertEqual(row["total_units"], 10.0)
+        self.assertEqual(row["total_sales"], 20.0)
+        self.assertEqual(row["avg_unit_price"], 2.00)
+
+    def test_similar_products_distinct_counts_no_duplicates(self):
+        """Verify distinct shoppers and promoted weeks do not double-count repeat trips or multi-store rows."""
+        df_test = pd.DataFrame({
+            "COMMODITY_DESC": ["SOFT DRINKS"] * 5,
+            "PRODUCT_ID": [101] * 5,
+            "QUANTITY": [1, 2, 1, 3, 2],
+            "SALES_VALUE": [2.0, 4.0, 2.0, 6.0, 4.0],
+            # Household 1 has 3 transactions, Household 2 has 2 transactions -> distinct shoppers = 2
+            "household_key": [1, 1, 1, 2, 2],
+            # Transactions in Week 10 (2 promo rows) and Week 12 (1 promo row) -> promoted weeks count = 2
+            "WEEK_NO": [10, 10, 11, 12, 12],
+            "has_causal_evidence": [True, True, False, True, False],
+            "SUB_COMMODITY_DESC": ["COLA"] * 5,
+            "BRAND": ["National"] * 5,
+            "CURR_SIZE_OF_PRODUCT": ["12 PK"] * 5
+        })
+        summary = an.get_similar_products_summary(df_test, "SOFT DRINKS", current_product_id=101)
+        row = summary.iloc[0]
+        self.assertEqual(row["distinct_shoppers"], 2)
+        self.assertEqual(row["promoted_weeks_count"], 2)
+
+    def test_similar_products_edge_cases(self):
+        """Verify empty input, missing values, single-product commodity, and fewer than top_n products."""
+        # 1. Empty and None df
+        cols = [
+            "PRODUCT_ID", "SUB_COMMODITY_DESC", "BRAND", "CURR_SIZE_OF_PRODUCT",
+            "total_units", "total_sales", "distinct_shoppers", "avg_unit_price",
+            "promoted_weeks_count", "is_focal"
+        ]
+        res_none = an.get_similar_products_summary(None, "SOFT DRINKS")
+        self.assertListEqual(list(res_none.columns), cols)
+        self.assertTrue(res_none.empty)
+
+        res_empty = an.get_similar_products_summary(pd.DataFrame(), "SOFT DRINKS")
+        self.assertListEqual(list(res_empty.columns), cols)
+        self.assertTrue(res_empty.empty)
+
+        # 2. Unknown commodity
+        df_single = pd.DataFrame({
+            "COMMODITY_DESC": ["PASTA"],
+            "PRODUCT_ID": [999],
+            "QUANTITY": [2],
+            "SALES_VALUE": [3.50],
+            "household_key": [10],
+            "WEEK_NO": [15],
+            "has_causal_evidence": [False]
+        })
+        res_missing_comm = an.get_similar_products_summary(df_single, "NON_EXISTENT")
+        self.assertTrue(res_missing_comm.empty)
+
+        # 3. Single-product commodity with top_n=10
+        res_single = an.get_similar_products_summary(df_single, "PASTA", top_n=10)
+        self.assertEqual(len(res_single), 1)
+        self.assertEqual(res_single.iloc[0]["PRODUCT_ID"], 999)
+
+        # 4. Zero sales / zero units
+        df_zeros = pd.DataFrame({
+            "COMMODITY_DESC": ["SNACKS"],
+            "PRODUCT_ID": [888],
+            "QUANTITY": [0],
+            "SALES_VALUE": [0.0],
+            "household_key": [5],
+            "WEEK_NO": [20],
+            "has_causal_evidence": [False]
+        })
+        res_zero = an.get_similar_products_summary(df_zeros, "SNACKS")
+        self.assertEqual(res_zero.iloc[0]["avg_unit_price"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

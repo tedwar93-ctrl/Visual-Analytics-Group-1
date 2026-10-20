@@ -11,6 +11,7 @@ from analytics import (
     identify_promotion_episodes,
     compare_before_during_after,
     get_household_behavior_summary,
+    get_similar_products_summary,
 )
 
 APP_DIR = Path(__file__).resolve().parent
@@ -240,12 +241,13 @@ weekly = get_weekly_trends(
     min_coverage_pct=100.0,
 )
 
-tab1, tab2, tab3, tab4 = st.tabs(
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
     [
         "📈 Weekly Trends",
         "🏷️ Promotion Evidence",
         "🔍 Before / During / After",
         "👥 Household Repurchase",
+        "🔄 Explore Similar Products",
     ]
 )
 
@@ -873,6 +875,216 @@ with tab4:
             # Summary Table
             st.markdown("**Full Household Behavior Summary Table**")
             st.dataframe(household_summary, use_container_width=True, hide_index=True)
+
+with tab5:
+    st.subheader("Explore Similar Products in Commodity")
+
+    if selected_product_id == 0:
+        st.info(
+            "👉 **Select a specific product in the sidebar (Filter 3: Product) to explore similar products within its commodity.**\n\n"
+            "Currently, 'All Products in Selection' is active. Choose an individual product to compare its purchasing dynamics, "
+            "promotional frequency, and weekly volume trends against comparable peer products."
+        )
+    else:
+        # 1. Product Metadata Banner
+        focal_rows = raw_df[raw_df["PRODUCT_ID"] == selected_product_id]
+        focal_dept = str(focal_rows["DEPARTMENT"].iloc[0]) if not focal_rows.empty else "N/A"
+        focal_comm = str(focal_rows["COMMODITY_DESC"].iloc[0]) if not focal_rows.empty else "N/A"
+        focal_subcomm = str(focal_rows["SUB_COMMODITY_DESC"].iloc[0]) if not focal_rows.empty else "N/A"
+        focal_brand = str(focal_rows["BRAND"].iloc[0]) if not focal_rows.empty else "N/A"
+        focal_size = str(focal_rows["CURR_SIZE_OF_PRODUCT"].iloc[0]) if (not focal_rows.empty and pd.notna(focal_rows["CURR_SIZE_OF_PRODUCT"].iloc[0])) else "N/A"
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.markdown(f"**Focal Product:** `ID {selected_product_id}`")
+        c2.markdown(f"**Commodity:** {focal_comm}")
+        c3.markdown(f"**Sub-Commodity:** {focal_subcomm}")
+        c4.markdown(f"**Brand & Size:** {focal_brand} ({focal_size})")
+
+        # 2. Extract similar products summary within the same commodity
+        if include_returns:
+            clean_df_comm = raw_df
+        else:
+            clean_df_comm = raw_df[(raw_df["QUANTITY"] > 0) & (raw_df["SALES_VALUE"] >= 0)]
+
+        similar_summary = get_similar_products_summary(
+            clean_df_comm,
+            focal_comm,
+            current_product_id=selected_product_id,
+            top_n=10,
+        )
+
+        if similar_summary.empty:
+            st.warning(f"No comparable products found in commodity '{focal_comm}'.")
+        else:
+            st.markdown("#### 1. Peer Products Comparison in Commodity")
+            st.caption(
+                f"Top volume products in **{focal_comm}**, highlighting the currently selected focal product (`ID {selected_product_id}`)."
+            )
+
+            # Display table with clear indicators
+            table_summary = similar_summary.copy()
+            table_summary["Role"] = table_summary["is_focal"].apply(
+                lambda x: "⭐ Focal Product" if x else "Peer Product"
+            )
+            col_order = [
+                "Role", "PRODUCT_ID", "SUB_COMMODITY_DESC", "BRAND",
+                "CURR_SIZE_OF_PRODUCT", "total_units", "total_sales",
+                "distinct_shoppers", "avg_unit_price", "promoted_weeks_count"
+            ]
+            display_df = table_summary[[c for c in col_order if c in table_summary.columns]]
+
+            st.dataframe(
+                display_df,
+                column_config={
+                    "Role": st.column_config.TextColumn("Product Type"),
+                    "PRODUCT_ID": st.column_config.NumberColumn("Product ID", format="%d"),
+                    "SUB_COMMODITY_DESC": st.column_config.TextColumn("Sub-Commodity"),
+                    "BRAND": st.column_config.TextColumn("Brand"),
+                    "CURR_SIZE_OF_PRODUCT": st.column_config.TextColumn("Package Size"),
+                    "total_units": st.column_config.NumberColumn("Units Sold", format="%d"),
+                    "total_sales": st.column_config.NumberColumn("Net Sales ($)", format="$%.2f"),
+                    "distinct_shoppers": st.column_config.NumberColumn("Shoppers", format="%d"),
+                    "avg_unit_price": st.column_config.NumberColumn("Avg Unit Price ($)", format="$%.2f"),
+                    "promoted_weeks_count": st.column_config.NumberColumn("Promoted Weeks", format="%d"),
+                },
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            # 3. Interactive Multi-Product Weekly Purchasing Comparison
+            st.markdown("#### 2. Weekly Purchasing Trends: Focal vs. Peer Products")
+
+            peer_labels = {}
+            for _, r in similar_summary.iterrows():
+                p_id = int(r["PRODUCT_ID"])
+                star = "⭐ Focal" if r["is_focal"] else "Peer"
+                peer_labels[p_id] = f"ID {p_id} - {r['BRAND']} ({r['SUB_COMMODITY_DESC']}) [{star}]"
+
+            # Default to focal product + top 2 peers
+            default_pids = [selected_product_id]
+            peers = [int(p) for p in similar_summary["PRODUCT_ID"] if int(p) != selected_product_id][:2]
+            default_selection = default_pids + peers
+
+            ctrl_c1, ctrl_c2 = st.columns([3, 2])
+            with ctrl_c1:
+                selected_compare_pids = st.multiselect(
+                    "Select products to compare over time (Max 5 recommended):",
+                    options=list(peer_labels.keys()),
+                    default=default_selection,
+                    format_func=lambda x: peer_labels.get(x, f"ID {x}"),
+                    help="Compare weekly purchasing trajectories to evaluate category-wide vs. product-specific shifts.",
+                )
+            with ctrl_c2:
+                compare_metric_choice = st.selectbox(
+                    "Comparison Metric (Y-Axis):",
+                    ["total_units", "total_sales", "purchasing_households"],
+                    index=0,
+                    format_func=lambda x: {
+                        "total_units": "Total Units Sold",
+                        "total_sales": "Total Net Sales ($)",
+                        "purchasing_households": "Active Purchasing Households",
+                    }[x],
+                    help="Metric displayed across fiscal weeks for the selected products.",
+                )
+
+            if not selected_compare_pids:
+                st.info("Select at least one product above to render the comparison trend chart.")
+            else:
+                metric_name = {
+                    "total_units": "Units Sold",
+                    "total_sales": "Net Sales ($)",
+                    "purchasing_households": "Active Households",
+                }[compare_metric_choice]
+
+                comparison_frames = []
+                for p_id in selected_compare_pids:
+                    p_trans = filter_data(clean_df_comm, product_id=p_id)
+                    p_weekly = get_weekly_trends(
+                        p_trans,
+                        include_returns=include_returns,
+                        min_week=week_range[0],
+                        max_week=week_range[1],
+                        promo_threshold_pct=float(promo_threshold),
+                    )
+                    p_weekly["Product"] = peer_labels.get(p_id, f"ID {p_id}")
+                    p_weekly["is_focal_product"] = (p_id == selected_product_id)
+                    comparison_frames.append(p_weekly)
+
+                all_compare_weekly = pd.concat(comparison_frames, ignore_index=True)
+
+                fig_compare = px.line(
+                    all_compare_weekly,
+                    x="WEEK_NO",
+                    y=compare_metric_choice,
+                    color="Product",
+                    markers=True,
+                    title=f"Visual 5: Weekly Purchasing Comparison — {metric_name} (Weeks {week_range[0]}–{week_range[1]})",
+                    labels={
+                        "WEEK_NO": "Fiscal Week (Time)",
+                        compare_metric_choice: metric_name,
+                        "Product": "Product Selection",
+                    },
+                )
+                fig_compare.update_layout(
+                    hovermode="x unified",
+                    margin=dict(t=50, b=40, l=60, r=20),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                )
+
+                # Shade unmonitored weeks 1-8 if present
+                if week_range[0] <= 8:
+                    fig_compare.add_vrect(
+                        x0=0.5, x1=8.5,
+                        fillcolor="#bdc3c7", opacity=0.25,
+                        layer="below", line_width=1, line_dash="dot", line_color="#7f8c8d",
+                        annotation_text="Weeks 1–8: Unmonitored Causal Coverage",
+                        annotation_position="top left",
+                        annotation_font=dict(size=9, color="#555"),
+                    )
+                # Shade week 102 if present
+                if week_range[1] >= 102:
+                    fig_compare.add_vrect(
+                        x0=101.5, x1=102.5,
+                        fillcolor="#bdc3c7", opacity=0.25,
+                        layer="below", line_width=1, line_dash="dot", line_color="#7f8c8d",
+                        annotation_text="Wk 102: Tracking End",
+                        annotation_position="top right",
+                        annotation_font=dict(size=9, color="#555"),
+                    )
+
+                st.plotly_chart(fig_compare, use_container_width=True)
+
+            # 4. Quick Peer Investigation Selector
+            st.markdown("#### 3. Investigate a Related Peer Product")
+            peer_candidates = [int(p) for p in similar_summary["PRODUCT_ID"] if int(p) != selected_product_id]
+            if peer_candidates:
+                chosen_peer = st.selectbox(
+                    "Select a peer product to inspect summary details:",
+                    options=peer_candidates,
+                    format_func=lambda x: peer_labels.get(x, f"ID {x}"),
+                    help="Inspect profile and key metrics for another product in this commodity.",
+                )
+                peer_row = similar_summary[similar_summary["PRODUCT_ID"] == chosen_peer].iloc[0]
+                st.info(
+                    f"🔍 **Peer Product Profile:** `ID {chosen_peer}` — **{peer_row['BRAND']}** ({peer_row['SUB_COMMODITY_DESC']})\n\n"
+                    f"- **Package Size:** {peer_row['CURR_SIZE_OF_PRODUCT']}\n"
+                    f"- **Total Units Sold:** {int(peer_row['total_units']):,} units\n"
+                    f"- **Total Net Sales:** ${peer_row['total_sales']:,.2f}\n"
+                    f"- **Active Purchasing Households:** {int(peer_row['distinct_shoppers']):,} households\n"
+                    f"- **Average Realized Unit Price:** ${peer_row['avg_unit_price']:.2f} / unit\n"
+                    f"- **Promoted Weeks Count:** {int(peer_row['promoted_weeks_count'])} weeks with audited causal activity\n\n"
+                    f"👉 *To evaluate this peer product's full Before/During/After lift windows and household repurchase cycles across Tabs 1–4, "
+                    f"choose **ID {chosen_peer}** in Sidebar Filter 3 (Product).*"
+                )
+
+            # 5. Methodological Explanation
+            st.markdown("---")
+            st.caption(
+                "**Visual Analytics Methodological Principle (Cross-Product Comparison):**\n"
+                "- Similar product purchasing trends allow category managers to evaluate whether promotional spikes and subsequent dips are isolated to a single brand or represent category-wide shopping dynamics.\n"
+                "- Parallel volume spikes across similar products may reflect shared promotional pressure, seasonal category demand (e.g. holiday peaks), or brand substitution; they describe observed empirical purchasing patterns and do not prove actual household stockpiling or promotion causality.\n"
+                "- Missing or incomplete promotion evidence (such as during Weeks 1–8 and Week 102) indicates that promotion status is unknown in the audit records, not necessarily that no promotion took place."
+            )
 
 st.divider()
 st.caption(

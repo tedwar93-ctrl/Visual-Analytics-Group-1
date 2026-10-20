@@ -777,3 +777,108 @@ def get_household_behavior_summary(
         "coverage_warning": cov_warning
     }
     return pd.DataFrame([result])
+
+
+# ==============================================================================
+# 6. SIMILAR PRODUCTS EXPLORATION
+# ==============================================================================
+
+def get_similar_products_summary(
+    df,
+    commodity_desc,
+    current_product_id=None,
+    top_n=10
+):
+    """
+    Summarizes purchasing performance for products within a specified commodity
+    to enable comparative cross-product exploration.
+
+    Parameters:
+    - df: DataFrame of transactions containing product metadata.
+    - commodity_desc: The commodity category to filter by (e.g., 'SOFT DRINKS').
+    - current_product_id: Optional ID of the focal product currently selected by the user.
+    - top_n: Maximum number of top products to return (by total units sold). If current_product_id
+             is provided and belongs to the commodity, it is guaranteed to be included in the output.
+
+    Returns:
+    - DataFrame with columns:
+        ['PRODUCT_ID', 'SUB_COMMODITY_DESC', 'BRAND', 'CURR_SIZE_OF_PRODUCT',
+         'total_units', 'total_sales', 'distinct_shoppers', 'avg_unit_price',
+         'promoted_weeks_count', 'is_focal']
+      Sorted by total_units descending, total_sales descending.
+    """
+    cols = [
+        "PRODUCT_ID", "SUB_COMMODITY_DESC", "BRAND", "CURR_SIZE_OF_PRODUCT",
+        "total_units", "total_sales", "distinct_shoppers", "avg_unit_price",
+        "promoted_weeks_count", "is_focal"
+    ]
+    if df is None or len(df) == 0 or commodity_desc is None:
+        return pd.DataFrame(columns=cols)
+
+    if "COMMODITY_DESC" not in df.columns or "PRODUCT_ID" not in df.columns:
+        return pd.DataFrame(columns=cols)
+
+    target_comm = str(commodity_desc).strip().upper()
+    comm_mask = df["COMMODITY_DESC"].astype(str).str.strip().str.upper() == target_comm
+    sub_df = df[comm_mask].copy()
+
+    if sub_df.empty:
+        return pd.DataFrame(columns=cols)
+
+    try:
+        focal_pid = int(current_product_id) if current_product_id is not None else None
+    except (ValueError, TypeError):
+        focal_pid = None
+
+    has_causal = "has_causal_evidence" in sub_df.columns
+    has_wk = "WEEK_NO" in sub_df.columns
+    has_hh = "household_key" in sub_df.columns
+
+    records = []
+    for pid, grp in sub_df.groupby("PRODUCT_ID"):
+        units = float(grp["QUANTITY"].dropna().sum()) if "QUANTITY" in grp.columns else 0.0
+        sales = float(grp["SALES_VALUE"].dropna().sum()) if "SALES_VALUE" in grp.columns else 0.0
+        shoppers = int(grp["household_key"].dropna().nunique()) if has_hh else 0
+        avg_price = (sales / units) if units > 0 else 0.0
+
+        if has_causal and has_wk:
+            promo_mask = grp["has_causal_evidence"].fillna(False).astype(bool)
+            promo_wks = int(grp.loc[promo_mask, "WEEK_NO"].dropna().nunique())
+        else:
+            promo_wks = 0
+
+        sub_desc = str(grp["SUB_COMMODITY_DESC"].iloc[0]) if ("SUB_COMMODITY_DESC" in grp.columns and pd.notna(grp["SUB_COMMODITY_DESC"].iloc[0])) else ""
+        brand = str(grp["BRAND"].iloc[0]) if ("BRAND" in grp.columns and pd.notna(grp["BRAND"].iloc[0])) else ""
+        sz = str(grp["CURR_SIZE_OF_PRODUCT"].iloc[0]) if ("CURR_SIZE_OF_PRODUCT" in grp.columns and pd.notna(grp["CURR_SIZE_OF_PRODUCT"].iloc[0])) else ""
+
+        records.append({
+            "PRODUCT_ID": int(pid),
+            "SUB_COMMODITY_DESC": sub_desc,
+            "BRAND": brand,
+            "CURR_SIZE_OF_PRODUCT": sz,
+            "total_units": units,
+            "total_sales": sales,
+            "distinct_shoppers": shoppers,
+            "avg_unit_price": round(avg_price, 2),
+            "promoted_weeks_count": promo_wks,
+            "is_focal": bool(focal_pid is not None and int(pid) == focal_pid)
+        })
+
+    summary_df = pd.DataFrame(records)
+    if summary_df.empty:
+        return pd.DataFrame(columns=cols)
+
+    summary_df = summary_df.sort_values(
+        ["total_units", "total_sales", "PRODUCT_ID"],
+        ascending=[False, False, True]
+    )
+
+    if top_n is not None and top_n > 0:
+        top_df = summary_df.head(top_n).copy()
+        if focal_pid is not None and summary_df["is_focal"].any():
+            if not top_df["is_focal"].any():
+                focal_row = summary_df[summary_df["is_focal"]]
+                top_df = pd.concat([top_df, focal_row], ignore_index=True)
+        return top_df
+
+    return summary_df
