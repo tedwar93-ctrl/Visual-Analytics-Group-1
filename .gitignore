@@ -3,8 +3,6 @@ database/causal_data.csv
 database/transaction_data.csv
 
 # Processed Parquet datasets
-database/*.parquet
-*.parquet
 
 # Python cache
 __pycache__/
