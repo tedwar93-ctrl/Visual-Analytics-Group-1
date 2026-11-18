@@ -1223,3 +1223,5 @@ st.caption(
     "proven causal claims or definitive stockpiling conclusions. Results depend on selected filters, promotion "
     "evidence thresholds, and clean comparison window availability."
 )
+
+gc.collect()
