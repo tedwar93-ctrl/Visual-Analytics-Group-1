@@ -38,9 +38,16 @@ st.markdown(
 )
 
 
-@st.cache_data
+@st.cache_data(max_entries=1)
 def load_data(path_string):
-    return pd.read_parquet(path_string)
+    df = pd.read_parquet(path_string)
+    for col in df.select_dtypes(include=["object", "string"]).columns:
+        df[col] = df[col].astype("category")
+    for col in df.select_dtypes(include=["float64"]).columns:
+        df[col] = df[col].astype("float32")
+    for col in df.select_dtypes(include=["int64"]).columns:
+        df[col] = df[col].astype("int32")
+    return df
 
 
 # -------------------- Dataset Discovery & Selection --------------------
