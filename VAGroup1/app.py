@@ -38,7 +38,7 @@ st.markdown(
 )
 
 
-@st.cache_data(max_entries=1)
+@st.cache_resource
 def load_data(path_string):
     df = pd.read_parquet(path_string)
     for col in df.select_dtypes(include=["object", "string"]).columns:
@@ -47,6 +47,7 @@ def load_data(path_string):
         df[col] = df[col].astype("float32")
     for col in df.select_dtypes(include=["int64"]).columns:
         df[col] = df[col].astype("int32")
+    gc.collect()
     return df
 
 
