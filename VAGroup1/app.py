@@ -5,6 +5,7 @@ import gc
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from bigquery_data import load_data as load_bigquery_data
 
 from analytics import (
     filter_data,
